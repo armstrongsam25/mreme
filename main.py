@@ -3,6 +3,7 @@ import sys
 import math
 import time
 import random
+import urllib.request
 from collections import deque
 
 # Hardware transforms make the Windows Media Foundation backend take several seconds to open a webcam
@@ -24,6 +25,12 @@ CAMERA_TIMEOUT_SECONDS = 3
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SCREENSHOT_DIR = os.path.join(BASE_DIR, "screenshots")
 RECORDING_DIR = os.path.join(BASE_DIR, "recordings")
+MODEL_PATH = os.path.join(BASE_DIR, "models", "holistic_landmarker.task")
+MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/holistic_landmarker/"
+             "holistic_landmarker/float16/1/holistic_landmarker.task")
+
+vision = mp.tasks.vision
+drawing_utils = vision.drawing_utils
 
 MEME_PATHS = {
     "thinking": os.path.join(BASE_DIR, "memes", "thinking.jpg"),
@@ -154,16 +161,15 @@ def calculate_distance(point_a, point_b):
 
 
 def get_finger_position(hand_landmarks, finger_index=8):
-    if hand_landmarks is None:
+    if not hand_landmarks:
         return None
-    landmark = hand_landmarks.landmark[finger_index]
-    return [landmark.x, landmark.y, getattr(landmark, "visibility", 1.0)]
+    landmark = hand_landmarks[finger_index]
+    return [landmark.x, landmark.y]
 
 
-def calculate_mouth_openness(face_landmarks):
-    if face_landmarks is None:
+def calculate_mouth_openness(landmarks):
+    if not landmarks:
         return 0
-    landmarks = face_landmarks.landmark
     upper_lip = [landmarks[13].x, landmarks[13].y]
     lower_lip = [landmarks[14].x, landmarks[14].y]
     left_corner = [landmarks[78].x, landmarks[78].y]
@@ -218,10 +224,10 @@ def draw_scanline_overlay(image, line_spacing=4, overlay_alpha=0.03):
 
 
 def get_face_bounding_box(face_landmarks, frame_width, frame_height, padding=0.3):
-    if face_landmarks is None:
+    if not face_landmarks:
         return None
-    x_coords = [lm.x * frame_width for lm in face_landmarks.landmark]
-    y_coords = [lm.y * frame_height for lm in face_landmarks.landmark]
+    x_coords = [lm.x * frame_width for lm in face_landmarks]
+    y_coords = [lm.y * frame_height for lm in face_landmarks]
     min_x, min_y = min(x_coords), min(y_coords)
     max_x, max_y = max(x_coords), max(y_coords)
     face_width = max_x - min_x
@@ -298,14 +304,33 @@ def setup_directories():
     os.makedirs(RECORDING_DIR, exist_ok=True)
 
 
+def download_model():
+    if os.path.exists(MODEL_PATH):
+        return True
+    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+    print(f"Downloading pose model to {MODEL_PATH} (one time, about 14 MB)...")
+    partial_path = MODEL_PATH + ".part"
+    try:
+        urllib.request.urlretrieve(MODEL_URL, partial_path)
+    except OSError as error:
+        print(f"Error: Cannot download pose model: {error}\n"
+              f"Download {MODEL_URL} manually and save it as {MODEL_PATH}")
+        return False
+    os.replace(partial_path, MODEL_PATH)
+    return True
+
+
 def create_pose_detector():
-    return mp.solutions.holistic.Holistic(
-        min_detection_confidence=0.6,
-        min_tracking_confidence=0.6,
-        smooth_landmarks=True,
-        model_complexity=1,
-        refine_face_landmarks=True,
+    options = vision.HolisticLandmarkerOptions(
+        base_options=mp.tasks.BaseOptions(model_asset_path=MODEL_PATH),
+        running_mode=vision.RunningMode.VIDEO,
+        min_pose_detection_confidence=0.6,
+        min_pose_landmarks_confidence=0.6,
+        min_face_detection_confidence=0.6,
+        min_face_landmarks_confidence=0.6,
+        min_hand_landmarks_confidence=0.6,
     )
+    return vision.HolisticLandmarker.create_from_options(options)
 
 
 def show_splash_screen(meme_images):
@@ -519,10 +544,10 @@ def detect_current_pose(pose_results, frame_width, frame_height):
     detected_pose = "staring"
     should_flip = False
 
-    if pose_results.pose_landmarks is None:
+    if not pose_results.pose_landmarks:
         return detected_pose, should_flip
 
-    landmarks = pose_results.pose_landmarks.landmark
+    landmarks = pose_results.pose_landmarks
     nose_position = [landmarks[0].x, landmarks[0].y]
     left_mouth = [landmarks[9].x, landmarks[9].y]
     right_mouth = [landmarks[10].x, landmarks[10].y]
@@ -566,8 +591,8 @@ def draw_debug_overlay(canvas, pose_results, frame_width, frame_height, mouth_ra
     cv2.putText(canvas, f"mouth:{mouth_ratio:.2f}", (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-    if pose_results.face_landmarks is not None:
-        face_lm = pose_results.face_landmarks.landmark
+    if pose_results.face_landmarks:
+        face_lm = pose_results.face_landmarks
         upper_lip_pos = (int(face_lm[13].x * frame_width), int(face_lm[13].y * frame_height))
         lower_lip_pos = (int(face_lm[14].x * frame_width), int(face_lm[14].y * frame_height))
         cv2.circle(canvas, upper_lip_pos, 5, (0, 255, 0), -1)
@@ -585,21 +610,21 @@ def draw_debug_overlay(canvas, pose_results, frame_width, frame_height, mouth_ra
         cv2.circle(canvas, pos, 10, (255, 0, 255), -1)
 
 
-def draw_skeleton_overlay(canvas, pose_results, drawing_utils):
+def draw_skeleton_overlay(canvas, pose_results):
     body_spec = drawing_utils.DrawingSpec(color=(255, 255, 255), thickness=3, circle_radius=2)
     hand_spec = drawing_utils.DrawingSpec(color=(0, 255, 255), thickness=2, circle_radius=2)
 
     drawing_utils.draw_landmarks(
         canvas, pose_results.pose_landmarks,
-        mp.solutions.holistic.POSE_CONNECTIONS, body_spec, body_spec
+        vision.PoseLandmarksConnections.POSE_LANDMARKS, body_spec, body_spec
     )
     drawing_utils.draw_landmarks(
         canvas, pose_results.right_hand_landmarks,
-        mp.solutions.holistic.HAND_CONNECTIONS, hand_spec, hand_spec
+        vision.HandLandmarksConnections.HAND_CONNECTIONS, hand_spec, hand_spec
     )
     drawing_utils.draw_landmarks(
         canvas, pose_results.left_hand_landmarks,
-        mp.solutions.holistic.HAND_CONNECTIONS, hand_spec, hand_spec
+        vision.HandLandmarksConnections.HAND_CONNECTIONS, hand_spec, hand_spec
     )
 
 
@@ -947,6 +972,9 @@ def main():
     meme_images = load_meme_images()
     pose_list = list(MEME_PATHS.keys())
 
+    if not download_model():
+        return
+
     capture = cv2.VideoCapture(0)
     if not capture.isOpened():
         print("Error: Cannot open camera")
@@ -964,9 +992,9 @@ def main():
         return
 
     pose_detector = create_pose_detector()
-    drawing_utils = mp.solutions.drawing_utils
     state = AppState()
     last_frame_time = time.time()
+    last_timestamp_ms = 0
 
     while capture.isOpened():
         success, frame = capture.read()
@@ -999,16 +1027,21 @@ def main():
 
         canvas = frame.copy()
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pose_results = pose_detector.process(rgb_frame)
+        # VIDEO mode needs strictly increasing timestamps
+        timestamp_ms = max(int(last_frame_time * 1000), last_timestamp_ms + 1)
+        last_timestamp_ms = timestamp_ms
+        pose_results = pose_detector.detect_for_video(
+            mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame), timestamp_ms
+        )
 
         detected_pose, should_flip = detect_current_pose(pose_results, frame_width, frame_height)
 
-        if state.debug_mode and pose_results.pose_landmarks is not None:
+        if state.debug_mode and pose_results.pose_landmarks:
             mouth_ratio = calculate_mouth_openness(pose_results.face_landmarks)
             draw_debug_overlay(canvas, pose_results, frame_width, frame_height, mouth_ratio)
 
-        if detected_pose == "staring" and pose_results.pose_landmarks is not None:
-            draw_skeleton_overlay(canvas, pose_results, drawing_utils)
+        if detected_pose == "staring" and pose_results.pose_landmarks:
+            draw_skeleton_overlay(canvas, pose_results)
 
         state.pose_history.append(detected_pose)
         if len(state.pose_history) > POSE_STABILITY_FRAMES:
@@ -1083,7 +1116,7 @@ def main():
                     state.flash_intensity = 180
         state.previous_meme = sized_memes[display_pose][meme_variant].copy()
 
-        if state.face_crop and pose_results.face_landmarks is not None:
+        if state.face_crop and pose_results.face_landmarks:
             face_bbox = get_face_bounding_box(pose_results.face_landmarks, frame_width, frame_height)
             meme_height, meme_width = current_meme.shape[:2]
             face_target_regions = {
@@ -1114,8 +1147,8 @@ def main():
 
         camera_view = canvas.copy()
 
-        if state.zoom_face and pose_results.pose_landmarks is not None:
-            nose = pose_results.pose_landmarks.landmark[0]
+        if state.zoom_face and pose_results.pose_landmarks:
+            nose = pose_results.pose_landmarks[0]
             center_x = int(nose.x * frame_width)
             center_y = int(nose.y * frame_height)
             zoom_width = frame_width // 2

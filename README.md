@@ -11,7 +11,7 @@ A real-time pose detection application built with Python, OpenCV, and MediaPipe 
 
 ## Features
 
-- Real-time pose detection using MediaPipe Holistic
+- Real-time pose detection using the MediaPipe Holistic Landmarker
 - Automatic monkey meme matching based on detected poses
 - Multiple display modes (split view, side-by-side, picture-in-picture)
 - Screenshot and video recording capabilities
@@ -29,9 +29,10 @@ A real-time pose detection application built with Python, OpenCV, and MediaPipe 
 
 ## Requirements
 
-- Python 3.8–3.11 (`mediapipe==0.10.9` has no wheels for Python 3.12 or newer)
+- Python 3.11–3.14
 - Computer with a webcam
 - Libraries in requirements.txt
+- Internet access on first run, to download the MediaPipe Holistic Landmarker model (about 14 MB) into `models/`
 
 ## Setup and running program
 
@@ -41,14 +42,14 @@ git clone https://github.com/vkunamneni1/mreme.git
 cd mreme
 ```
 
-Create a Python 3.11 virtual environment
+Create a virtual environment (any Python from 3.11 to 3.14)
 ```bash
 # Windows
-py -3.11 -m venv .venv
+py -m venv .venv
 .venv\Scripts\activate
 
 # macOS / Linux
-python3.11 -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 ```
 
@@ -61,6 +62,8 @@ Run program
 ```bash
 python main.py
 ```
+
+On the first run the app downloads the pose model to `models/holistic_landmarker.task`. If the download fails, get it from the URL the app prints and save it at that path.
 
 If the app reports that it cannot read frames from the camera, close any other app that is using the webcam (Teams, Zoom, browser tabs, OBS) and try again. Press `C` in the app to switch to another camera.
 
