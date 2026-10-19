@@ -3,6 +3,7 @@ import sys
 import math
 import time
 import random
+import argparse
 import urllib.request
 from collections import deque
 
@@ -12,6 +13,7 @@ os.environ.setdefault("OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS", "0")
 import cv2
 import numpy as np
 import mediapipe as mp
+import pyvirtualcam
 
 
 WINDOW_NAME = "Meme Mirror"
@@ -21,6 +23,10 @@ POINTING_OFFSET = 0.05
 POSE_STABILITY_FRAMES = 3
 MAX_CAMERAS = 3
 CAMERA_TIMEOUT_SECONDS = 3
+VIRTUAL_CAM_WIDTH, VIRTUAL_CAM_HEIGHT, VIRTUAL_CAM_FPS = 1280, 720, 30
+# Media Foundation only lists real webcams on Windows; the DirectShow fallback would also
+# open the OBS Virtual Camera and feed the app its own output
+CAMERA_API = cv2.CAP_MSMF if sys.platform == "win32" else cv2.CAP_ANY
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SCREENSHOT_DIR = os.path.join(BASE_DIR, "screenshots")
@@ -78,7 +84,7 @@ class AppState:
     def __init__(self):
         self.debug_mode = False
         self.fullscreen = False
-        self.meme_only = False
+        self.meme_only = True
         self.paused = False
         self.side_by_side = False
         self.pip_mode = False
@@ -100,6 +106,7 @@ class AppState:
         self.blend_alpha = 1.0
         self.flash_intensity = 0
         self.video_writer = None
+        self.virtual_cam = None
         self.gif_buffer = deque(maxlen=90)
         self.pose_history = []
         self.last_detected_pose = "staring"
@@ -149,11 +156,41 @@ def switch_camera(state, capture):
     for offset in range(1, MAX_CAMERAS):
         next_index = (previous_index + offset) % MAX_CAMERAS
         capture.release()
-        if capture.open(next_index) and camera_is_streaming(capture, attempts=5):
+        if capture.open(next_index, CAMERA_API) and camera_is_streaming(capture, attempts=5):
             state.camera_index = next_index
             return
     capture.release()
-    capture.open(previous_index)
+    capture.open(previous_index, CAMERA_API)
+
+
+def start_virtual_camera(state):
+    try:
+        state.virtual_cam = pyvirtualcam.Camera(
+            VIRTUAL_CAM_WIDTH, VIRTUAL_CAM_HEIGHT, VIRTUAL_CAM_FPS, fmt=pyvirtualcam.PixelFormat.BGR
+        )
+    except RuntimeError as error:
+        print(f"Virtual camera is off: {error}\n"
+              "On Windows, install OBS Studio (https://obsproject.com) to get the OBS Virtual Camera, "
+              "then press O to try again. Run with --no-virtual-cam to skip it.")
+        return
+    print(f"Virtual camera on: pick '{state.virtual_cam.device}' as the camera in Teams/Zoom")
+    cv2.setWindowTitle(WINDOW_NAME, f"{WINDOW_NAME} - virtual camera on")
+
+
+def stop_virtual_camera(state):
+    if state.virtual_cam is not None:
+        state.virtual_cam.close()
+        state.virtual_cam = None
+
+
+def fit_to_frame(image, width, height):
+    image_height, image_width = image.shape[:2]
+    scale = min(width / image_width, height / image_height)
+    fitted_width, fitted_height = int(image_width * scale), int(image_height * scale)
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    x, y = (width - fitted_width) // 2, (height - fitted_height) // 2
+    frame[y : y + fitted_height, x : x + fitted_width] = cv2.resize(image, (fitted_width, fitted_height))
+    return frame
 
 
 def calculate_distance(point_a, point_b):
@@ -287,15 +324,23 @@ def load_meme_images():
 
 
 def get_sized_memes(state, meme_images, frame_width, frame_height):
-    if state.sized_memes_key != (frame_width, frame_height):
+    # Meme-only shows the memes square at the virtual camera's height; the split view squeezes them
+    if state.meme_only:
+        meme_size = (VIRTUAL_CAM_HEIGHT, VIRTUAL_CAM_HEIGHT)
+    else:
+        meme_size = (frame_width, frame_height // 2)
+    if state.sized_memes_key != meme_size:
         state.sized_memes = {}
         for pose_name, image in meme_images.items():
-            resized = cv2.resize(image, (frame_width, frame_height // 2))
+            if state.meme_only:
+                resized = fit_to_frame(image, *meme_size)
+            else:
+                resized = cv2.resize(image, meme_size)
             state.sized_memes[pose_name] = {
                 "normal": resized,
                 "flipped": cv2.flip(resized, 1),
             }
-        state.sized_memes_key = (frame_width, frame_height)
+        state.sized_memes_key = meme_size
     return state.sized_memes
 
 
@@ -511,6 +556,8 @@ def show_splash_screen(meme_images):
         "S - screenshot",
         "R - start/stop recording",
         "F - fullscreen",
+        "M - meme only / split view",
+        "O - virtual camera on/off",
         "Q - quit",
     ]
     for i, control in enumerate(control_list):
@@ -737,7 +784,7 @@ def compose_output_frame(camera_view, meme_view, state, frame_width, frame_heigh
         return np.vstack([camera_resized, meme_resized])
 
     if state.meme_only:
-        return cv2.resize(meme_view, (frame_width, frame_height))
+        return meme_view.copy()
 
     if state.side_by_side:
         camera_half = cv2.resize(camera_view, (frame_width // 2, frame_height))
@@ -873,6 +920,7 @@ def draw_help_menu(output, state):
         "G - save gif", "F - fullscreen", "P - pause", "M - meme only",
         "B - side by side", "I - pip mode", "Z - zoom face",
         "X - chaos mode", "D - debug", "C - switch camera",
+        "O - virtual camera",
     ]
 
     menu_width = 180
@@ -913,9 +961,11 @@ def handle_keypress(key, state, output, capture, pose_list):
     elif key == ord("b"):
         state.side_by_side = not state.side_by_side
         state.pip_mode = False
+        state.meme_only = False
     elif key == ord("i"):
         state.pip_mode = not state.pip_mode
         state.side_by_side = False
+        state.meme_only = False
     elif key == ord("z"):
         state.zoom_face = not state.zoom_face
     elif key == ord("x"):
@@ -930,6 +980,12 @@ def handle_keypress(key, state, output, capture, pose_list):
         state.face_crop = not state.face_crop
     elif key == ord("c"):
         switch_camera(state, capture)
+    elif key == ord("o"):
+        if state.virtual_cam is None:
+            start_virtual_camera(state)
+        else:
+            stop_virtual_camera(state)
+            cv2.setWindowTitle(WINDOW_NAME, WINDOW_NAME)
     elif key == ord("r"):
         state.recording = not state.recording
         if state.recording:
@@ -967,7 +1023,15 @@ def handle_keypress(key, state, output, capture, pose_list):
     return True
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Meme Mirror")
+    parser.add_argument("--virtual-cam", action=argparse.BooleanOptionalAction, default=True,
+                        help="send the output to a virtual camera for Teams/Zoom (on by default)")
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
     setup_directories()
     meme_images = load_meme_images()
     pose_list = list(MEME_PATHS.keys())
@@ -975,7 +1039,7 @@ def main():
     if not download_model():
         return
 
-    capture = cv2.VideoCapture(0)
+    capture = cv2.VideoCapture(0, CAMERA_API)
     if not capture.isOpened():
         print("Error: Cannot open camera")
         return
@@ -993,6 +1057,8 @@ def main():
 
     pose_detector = create_pose_detector()
     state = AppState()
+    if args.virtual_cam:
+        start_virtual_camera(state)
     last_frame_time = time.time()
     last_timestamp_ms = 0
 
@@ -1171,10 +1237,14 @@ def main():
 
         if not state.meme_only:
             draw_scanline_overlay(output, line_spacing=3, overlay_alpha=0.02)
+        draw_watermark(output, state)
+
+        # The virtual camera gets the picture without the on-screen controls drawn below
+        if state.virtual_cam is not None:
+            state.virtual_cam.send(fit_to_frame(output, VIRTUAL_CAM_WIDTH, VIRTUAL_CAM_HEIGHT))
 
         draw_status_indicators(output, state)
         draw_mode_badges(output, state)
-        draw_watermark(output, state)
 
         output_height, output_width = output.shape[:2]
         draw_corner_brackets(output, 4, output_height - 28, output_width - 4, output_height - 4,
@@ -1206,6 +1276,7 @@ def main():
     capture.release()
     if state.video_writer is not None:
         state.video_writer.release()
+    stop_virtual_camera(state)
     cv2.destroyAllWindows()
     pose_detector.close()
 
