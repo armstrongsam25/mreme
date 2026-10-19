@@ -1,8 +1,13 @@
 import os
+import sys
 import math
 import time
 import random
 from collections import deque
+
+# Hardware transforms make the Windows Media Foundation backend take several seconds to open a webcam
+os.environ.setdefault("OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS", "0")
+
 import cv2
 import numpy as np
 import mediapipe as mp
@@ -12,12 +17,28 @@ WINDOW_NAME = "Meme Mirror"
 TOUCH_THRESHOLD = 0.08
 MOUTH_OPEN_THRESHOLD = 0.5
 POINTING_OFFSET = 0.05
+POSE_STABILITY_FRAMES = 3
+MAX_CAMERAS = 3
+CAMERA_TIMEOUT_SECONDS = 3
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SCREENSHOT_DIR = os.path.join(BASE_DIR, "screenshots")
+RECORDING_DIR = os.path.join(BASE_DIR, "recordings")
 
 MEME_PATHS = {
-    "thinking": "memes/thinking.jpg",
-    "pointing": "memes/pointing.jpg",
-    "shocked": "memes/shocked.jpg",
-    "staring": "memes/staring.jpg",
+    "thinking": os.path.join(BASE_DIR, "memes", "thinking.jpg"),
+    "pointing": os.path.join(BASE_DIR, "memes", "pointing.jpg"),
+    "shocked": os.path.join(BASE_DIR, "memes", "shocked.jpg"),
+    "staring": os.path.join(BASE_DIR, "memes", "staring.jpg"),
+}
+
+KEY_LEFT, KEY_RIGHT, KEY_UP = -2, -3, -4
+
+# Raw cv2.waitKeyEx codes for arrow keys on Windows, Linux (GTK) and macOS
+ARROW_KEY_CODES = {
+    2424832: KEY_LEFT, 65361: KEY_LEFT, 63234: KEY_LEFT,
+    2555904: KEY_RIGHT, 65363: KEY_RIGHT, 63235: KEY_RIGHT,
+    2490368: KEY_UP, 65362: KEY_UP, 63232: KEY_UP,
 }
 
 POSE_COLORS = {
@@ -84,6 +105,48 @@ class AppState:
         self.roast_timer = 0
         self.frame_count = 0
         self.ui_pulse = 0
+        self.frame_interval = 1 / 30
+        self.stable_pose = "staring"
+        self.stable_flip = False
+        self.last_output = None
+        self.video_size = None
+        self.window_size = None
+        self.sized_memes = None
+        self.sized_memes_key = None
+
+
+def wait_for_key(delay):
+    key = cv2.waitKeyEx(delay)
+    if key in ARROW_KEY_CODES:
+        return ARROW_KEY_CODES[key]
+    key &= 0xFF
+    if ord("A") <= key <= ord("Z"):
+        key += ord("a") - ord("A")
+    return key
+
+
+def window_closed():
+    return cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1
+
+
+def camera_is_streaming(capture, attempts=20):
+    for _ in range(attempts):
+        if capture.read()[0]:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def switch_camera(state, capture):
+    previous_index = state.camera_index
+    for offset in range(1, MAX_CAMERAS):
+        next_index = (previous_index + offset) % MAX_CAMERAS
+        capture.release()
+        if capture.open(next_index) and camera_is_streaming(capture, attempts=5):
+            state.camera_index = next_index
+            return
+    capture.release()
+    capture.open(previous_index)
 
 
 def calculate_distance(point_a, point_b):
@@ -212,14 +275,27 @@ def load_meme_images():
         image = cv2.imread(file_path)
         if image is None:
             print(f"Error: Cannot load meme image at {file_path}")
-            exit(1)
+            sys.exit(1)
         images[pose_name] = image
     return images
 
 
+def get_sized_memes(state, meme_images, frame_width, frame_height):
+    if state.sized_memes_key != (frame_width, frame_height):
+        state.sized_memes = {}
+        for pose_name, image in meme_images.items():
+            resized = cv2.resize(image, (frame_width, frame_height // 2))
+            state.sized_memes[pose_name] = {
+                "normal": resized,
+                "flipped": cv2.flip(resized, 1),
+            }
+        state.sized_memes_key = (frame_width, frame_height)
+    return state.sized_memes
+
+
 def setup_directories():
-    os.makedirs("screenshots", exist_ok=True)
-    os.makedirs("recordings", exist_ok=True)
+    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+    os.makedirs(RECORDING_DIR, exist_ok=True)
 
 
 def create_pose_detector():
@@ -270,8 +346,8 @@ def show_splash_screen(meme_images):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (60, 60, 60), 1)
 
         cv2.imshow(WINDOW_NAME, canvas)
-        key = cv2.waitKey(50) & 0xFF
-        if key == ord("q"):
+        key = wait_for_key(50)
+        if key == ord("q") or window_closed():
             return False
         if key == ord(" ") and frame_index > 8:
             break
@@ -344,14 +420,14 @@ def show_splash_screen(meme_images):
         else:
             flash_value = 255 if frame_index % 2 == 0 else 0
             canvas[:] = (flash_value, flash_value, flash_value)
-            go_text = random.choice(["GO", "→", "POSE"])
+            go_text = random.choice(["GO", ">>", "POSE"])
             (go_w, go_h), _ = cv2.getTextSize(go_text, cv2.FONT_HERSHEY_SIMPLEX, 3, 4)
             text_color = (0, 0, 0) if flash_value else (255, 255, 255)
             cv2.putText(canvas, go_text, (screen_width // 2 - go_w // 2, screen_height // 2 + go_h // 2),
                         cv2.FONT_HERSHEY_SIMPLEX, 3, text_color, 4)
 
         cv2.imshow(WINDOW_NAME, canvas)
-        if cv2.waitKey(45) & 0xFF == ord("q"):
+        if wait_for_key(45) == ord("q") or window_closed():
             return False
 
     tutorial_slides = [
@@ -389,8 +465,8 @@ def show_splash_screen(meme_images):
 
         cv2.imshow(WINDOW_NAME, canvas)
         while True:
-            key = cv2.waitKey(50) & 0xFF
-            if key == ord("q"):
+            key = wait_for_key(50)
+            if key == ord("q") or window_closed():
                 return False
             if key == ord(" "):
                 break
@@ -423,8 +499,8 @@ def show_splash_screen(meme_images):
 
     cv2.imshow(WINDOW_NAME, canvas)
     while True:
-        key = cv2.waitKey(50) & 0xFF
-        if key == ord("q"):
+        key = wait_for_key(50)
+        if key == ord("q") or window_closed():
             return False
         if key == ord(" "):
             break
@@ -660,8 +736,7 @@ def compose_output_frame(camera_view, meme_view, state, frame_width, frame_heigh
 def draw_status_indicators(output, state):
     output_height, output_width = output.shape[:2]
 
-    fps_value = 1 / (time.time() - state.frame_timestamp + 0.001)
-    fps_text = f"{int(fps_value)}"
+    fps_text = f"{int(1 / state.frame_interval)}"
     cv2.putText(output, fps_text, (10, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (50, 50, 50), 1)
     cv2.putText(output, "fps", (10 + len(fps_text) * 9, 18),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.3, (35, 35, 35), 1)
@@ -799,11 +874,13 @@ def handle_keypress(key, state, output, capture, pose_list):
     elif key == ord("d"):
         state.debug_mode = not state.debug_mode
     elif key == ord("s"):
-        filename = f"screenshots/meme_{int(time.time())}.png"
+        filename = os.path.join(SCREENSHOT_DIR, f"meme_{int(time.time() * 1000)}.png")
         cv2.imwrite(filename, output)
         state.flash_intensity = 255
     elif key == ord("f"):
         state.fullscreen = not state.fullscreen
+        window_mode = cv2.WINDOW_FULLSCREEN if state.fullscreen else cv2.WINDOW_NORMAL
+        cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, window_mode)
     elif key == ord("p"):
         state.paused = not state.paused
     elif key == ord("m"):
@@ -827,34 +904,39 @@ def handle_keypress(key, state, output, capture, pose_list):
     elif key == ord("a"):
         state.face_crop = not state.face_crop
     elif key == ord("c"):
-        state.camera_index = (state.camera_index + 1) % 3
-        capture.release()
-        capture.open(state.camera_index)
+        switch_camera(state, capture)
     elif key == ord("r"):
         state.recording = not state.recording
         if state.recording:
             output_height, output_width = output.shape[:2]
-            filename = f"recordings/meme_{int(time.time())}.mp4"
+            filename = os.path.join(RECORDING_DIR, f"meme_{int(time.time())}.mp4")
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             state.video_writer = cv2.VideoWriter(filename, fourcc, 20.0, (output_width, output_height))
+            state.video_size = (output_width, output_height)
+            if not state.video_writer.isOpened():
+                print(f"Error: Cannot start recording to {filename}")
+                state.recording = False
+                state.video_writer = None
         elif state.video_writer is not None:
             state.video_writer.release()
             state.video_writer = None
     elif key == ord("g"):
+        gif_dir = os.path.join(SCREENSHOT_DIR, f"gif_{int(time.time())}")
+        os.makedirs(gif_dir, exist_ok=True)
         for i, frame in enumerate(state.gif_buffer):
-            cv2.imwrite(f"screenshots/gif_{i:03d}.png", frame)
+            cv2.imwrite(os.path.join(gif_dir, f"frame_{i:03d}.png"), frame)
         state.flash_intensity = 255
     elif key == ord("t"):
         state.last_roast = random.choice(ROAST_MESSAGES)
         state.roast_timer = time.time()
-    elif key in [81, 2]:
+    elif key == KEY_LEFT:
         if state.manual_pose_index >= 0:
             state.manual_pose_index = (state.manual_pose_index - 1) % len(pose_list)
         else:
             state.manual_pose_index = len(pose_list) - 1
-    elif key in [83, 3]:
+    elif key == KEY_RIGHT:
         state.manual_pose_index = (state.manual_pose_index + 1) % len(pose_list)
-    elif key in [82, 0]:
+    elif key == KEY_UP:
         state.manual_pose_index = -1
 
     return True
@@ -870,6 +952,12 @@ def main():
         print("Error: Cannot open camera")
         return
 
+    if not camera_is_streaming(capture):
+        print("Error: Camera opened but is not sending frames. "
+              "Close other apps using the webcam (Teams, Zoom, browser tabs, OBS) and try again.")
+        capture.release()
+        return
+
     if not show_splash_screen(meme_images):
         capture.release()
         cv2.destroyAllWindows()
@@ -878,31 +966,36 @@ def main():
     pose_detector = create_pose_detector()
     drawing_utils = mp.solutions.drawing_utils
     state = AppState()
+    last_frame_time = time.time()
 
     while capture.isOpened():
         success, frame = capture.read()
         if not success:
+            if time.time() - last_frame_time > CAMERA_TIMEOUT_SECONDS:
+                print("Error: Camera stopped sending frames")
+                break
+            if wait_for_key(10) == ord("q") or window_closed():
+                break
             continue
+        last_frame_time = time.time()
 
         frame = cv2.flip(frame, 1)
         frame_height, frame_width = frame.shape[:2]
 
         if state.paused:
-            cv2.imshow(WINDOW_NAME, state.last_output if hasattr(state, "last_output") else frame)
-            key = cv2.waitKey(5) & 0xFF
+            cv2.imshow(WINDOW_NAME, state.last_output if state.last_output is not None else frame)
+            key = wait_for_key(5)
             if key == ord("p"):
                 state.paused = False
-            if key == ord("q"):
+            if key == ord("q") or window_closed():
                 break
             continue
 
-        sized_memes = {}
-        for pose_name, image in meme_images.items():
-            resized = cv2.resize(image, (frame_width, frame_height // 2))
-            sized_memes[pose_name] = {
-                "normal": resized,
-                "flipped": cv2.flip(resized, 1),
-            }
+        frame_interval = max(last_frame_time - state.frame_timestamp, 1e-3)
+        state.frame_timestamp = last_frame_time
+        state.frame_interval = 0.9 * state.frame_interval + 0.1 * frame_interval
+
+        sized_memes = get_sized_memes(state, meme_images, frame_width, frame_height)
 
         canvas = frame.copy()
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -918,13 +1011,14 @@ def main():
             draw_skeleton_overlay(canvas, pose_results, drawing_utils)
 
         state.pose_history.append(detected_pose)
-        if len(state.pose_history) > 5:
+        if len(state.pose_history) > POSE_STABILITY_FRAMES:
             state.pose_history.pop(0)
 
-        stable_pose = detected_pose
-        if len(state.pose_history) >= 2:
-            if state.pose_history.count(state.pose_history[-1]) >= 2:
-                stable_pose = state.pose_history[-1]
+        if state.pose_history.count(detected_pose) == POSE_STABILITY_FRAMES:
+            state.stable_pose = detected_pose
+            state.stable_flip = should_flip
+        stable_pose = state.stable_pose
+        should_flip = state.stable_flip
 
         state.pose_counts[stable_pose] += 1
         total_poses = sum(state.pose_counts.values())
@@ -1024,16 +1118,16 @@ def main():
             nose = pose_results.pose_landmarks.landmark[0]
             center_x = int(nose.x * frame_width)
             center_y = int(nose.y * frame_height)
-            zoom_size = min(frame_width, frame_height) // 2
+            zoom_width = frame_width // 2
+            zoom_height = frame_height // 2
 
-            crop_x1 = max(0, center_x - zoom_size // 2)
-            crop_y1 = max(0, center_y - zoom_size // 2)
-            crop_x2 = min(frame_width, crop_x1 + zoom_size)
-            crop_y2 = min(frame_height, crop_y1 + zoom_size)
+            crop_x1 = min(max(0, center_x - zoom_width // 2), frame_width - zoom_width)
+            crop_y1 = min(max(0, center_y - zoom_height // 2), frame_height - zoom_height)
+            crop_x2 = crop_x1 + zoom_width
+            crop_y2 = crop_y1 + zoom_height
 
-            if crop_x2 - crop_x1 > 50 and crop_y2 - crop_y1 > 50:
-                camera_view = cv2.resize(canvas[crop_y1:crop_y2, crop_x1:crop_x2],
-                                         (frame_width, frame_height))
+            camera_view = cv2.resize(canvas[crop_y1:crop_y2, crop_x1:crop_x2],
+                                     (frame_width, frame_height))
 
         header_height = draw_header_ui(camera_view, state, frame_width, display_pose)
         draw_footer_ui(camera_view, state, frame_width, frame_height, display_pose)
@@ -1041,8 +1135,6 @@ def main():
         draw_roast_message(camera_view, state, frame_width, frame_height)
 
         output = compose_output_frame(camera_view, current_meme, state, frame_width, frame_height)
-
-        state.frame_timestamp = time.time()
 
         if not state.meme_only:
             draw_scanline_overlay(output, line_spacing=3, overlay_alpha=0.02)
@@ -1060,21 +1152,22 @@ def main():
         draw_help_menu(output, state)
 
         if state.recording and state.video_writer is not None:
-            state.video_writer.write(output)
+            if (output_width, output_height) != state.video_size:
+                state.video_writer.write(cv2.resize(output, state.video_size))
+            else:
+                state.video_writer.write(output)
 
         state.gif_buffer.append(output.copy())
         state.last_output = output
 
-        if state.fullscreen:
-            cv2.namedWindow(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN)
-            cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-        else:
-            cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+        if not state.fullscreen and state.window_size != (output_width, output_height):
+            cv2.resizeWindow(WINDOW_NAME, output_width, output_height)
+            state.window_size = (output_width, output_height)
 
         cv2.imshow(WINDOW_NAME, output)
 
-        key = cv2.waitKey(5) & 0xFF
-        if not handle_keypress(key, state, output, capture, pose_list):
+        key = wait_for_key(5)
+        if window_closed() or not handle_keypress(key, state, output, capture, pose_list):
             break
 
     capture.release()

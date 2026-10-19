@@ -29,7 +29,7 @@ A real-time pose detection application built with Python, OpenCV, and MediaPipe 
 
 ## Requirements
 
-- Python 3.11+
+- Python 3.8–3.11 (`mediapipe==0.10.9` has no wheels for Python 3.12 or newer)
 - Computer with a webcam
 - Libraries in requirements.txt
 
@@ -37,8 +37,19 @@ A real-time pose detection application built with Python, OpenCV, and MediaPipe 
 
 First, clone the repo
 ```bash
-git clone https://github.com/yourusername/mreme.git
+git clone https://github.com/vkunamneni1/mreme.git
 cd mreme
+```
+
+Create a Python 3.11 virtual environment
+```bash
+# Windows
+py -3.11 -m venv .venv
+.venv\Scripts\activate
+
+# macOS / Linux
+python3.11 -m venv .venv
+source .venv/bin/activate
 ```
 
 Install necessary dependencies
@@ -50,6 +61,8 @@ Run program
 ```bash
 python main.py
 ```
+
+If the app reports that it cannot read frames from the camera, close any other app that is using the webcam (Teams, Zoom, browser tabs, OBS) and try again. Press `C` in the app to switch to another camera.
 
 ## Controls
 
