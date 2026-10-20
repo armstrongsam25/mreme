@@ -20,6 +20,14 @@ WINDOW_NAME = "Meme Mirror"
 TOUCH_THRESHOLD = 0.08
 MOUTH_OPEN_THRESHOLD = 0.5
 POINTING_OFFSET = 0.05
+# How close a hand must be to an eye to count as wiping tears, measured in eye-to-eye distances
+EYE_RUB_DISTANCE = 0.7
+# Fingertip distance from the wrist divided by the finger's middle joint distance from the wrist
+FINGER_STRAIGHT_REACH = 1.2
+FINGER_CURLED_REACH = 1.0
+# The chest is the band from the shoulders down to this many shoulder widths below them
+CHEST_DEPTH = 0.8
+MIN_VISIBILITY = 0.5
 POSE_STABILITY_FRAMES = 3
 MAX_CAMERAS = 3
 CAMERA_TIMEOUT_SECONDS = 3
@@ -43,6 +51,9 @@ MEME_PATHS = {
     "pointing": os.path.join(BASE_DIR, "memes", "pointing.jpg"),
     "shocked": os.path.join(BASE_DIR, "memes", "shocked.jpg"),
     "staring": os.path.join(BASE_DIR, "memes", "staring.jpg"),
+    "loving": os.path.join(BASE_DIR, "memes", "loving.jpg"),
+    "sad": os.path.join(BASE_DIR, "memes", "sad.jpg"),
+    "middle_finger": os.path.join(BASE_DIR, "memes", "middle_finger.jpg"),
 }
 
 KEY_LEFT, KEY_RIGHT, KEY_UP = -2, -3, -4
@@ -59,6 +70,9 @@ POSE_COLORS = {
     "thinking": (0, 180, 255),
     "pointing": (0, 255, 120),
     "shocked": (80, 80, 255),
+    "loving": (180, 105, 255),
+    "sad": (230, 160, 60),
+    "middle_finger": (220, 60, 160),
 }
 
 ROAST_MESSAGES = [
@@ -112,7 +126,7 @@ class AppState:
         self.last_detected_pose = "staring"
         self.frame_timestamp = time.time()
         self.session_start = time.time()
-        self.pose_counts = {"thinking": 0, "pointing": 0, "shocked": 0, "staring": 0}
+        self.pose_counts = {pose_name: 0 for pose_name in MEME_PATHS}
         self.cringe_score = 0
         self.ego_deaths = 0
         self.last_roast = ""
@@ -216,6 +230,52 @@ def calculate_mouth_openness(landmarks):
     if horizontal_distance == 0:
         return 0
     return vertical_distance / horizontal_distance
+
+
+def is_hand_on_eye(hand_landmarks, landmarks, frame_width, frame_height):
+    if not hand_landmarks:
+        return False
+    eyes = [[landmarks[index].x * frame_width, landmarks[index].y * frame_height] for index in (2, 5)]
+    eye_distance = calculate_distance(*eyes)
+    # Thumb tip plus the knuckles and tips of the index and middle fingers
+    hand_points = [[hand_landmarks[index].x * frame_width, hand_landmarks[index].y * frame_height]
+                   for index in (4, 5, 6, 8, 9, 10, 12)]
+    return any(calculate_distance(point, eye) < eye_distance * EYE_RUB_DISTANCE
+               for point in hand_points for eye in eyes)
+
+
+def calculate_finger_reach(hand_landmarks, tip_index, middle_joint_index):
+    wrist = [hand_landmarks[0].x, hand_landmarks[0].y]
+    tip = [hand_landmarks[tip_index].x, hand_landmarks[tip_index].y]
+    middle_joint = [hand_landmarks[middle_joint_index].x, hand_landmarks[middle_joint_index].y]
+    joint_distance = calculate_distance(wrist, middle_joint)
+    if joint_distance == 0:
+        return 0
+    return calculate_distance(wrist, tip) / joint_distance
+
+
+def is_middle_finger_up(hand_landmarks):
+    if not hand_landmarks:
+        return False
+    other_fingers = [(8, 6), (16, 14), (20, 18)]
+    return (calculate_finger_reach(hand_landmarks, 12, 10) > FINGER_STRAIGHT_REACH
+            and all(calculate_finger_reach(hand_landmarks, tip, joint) < FINGER_CURLED_REACH
+                    for tip, joint in other_fingers))
+
+
+def is_hand_on_chest(landmarks, palm_indices, frame_width, frame_height):
+    palm_landmarks = [landmarks[index] for index in palm_indices]
+    if min(landmark.visibility for landmark in palm_landmarks) < MIN_VISIBILITY:
+        return False
+    palm_x = sum(landmark.x for landmark in palm_landmarks) / len(palm_landmarks) * frame_width
+    palm_y = sum(landmark.y for landmark in palm_landmarks) / len(palm_landmarks) * frame_height
+    left_shoulder = [landmarks[11].x * frame_width, landmarks[11].y * frame_height]
+    right_shoulder = [landmarks[12].x * frame_width, landmarks[12].y * frame_height]
+    shoulder_width = calculate_distance(left_shoulder, right_shoulder)
+    shoulder_y = (left_shoulder[1] + right_shoulder[1]) / 2
+    shoulder_left_x, shoulder_right_x = sorted([left_shoulder[0], right_shoulder[0]])
+    return (shoulder_left_x < palm_x < shoulder_right_x
+            and shoulder_y < palm_y < shoulder_y + shoulder_width * CHEST_DEPTH)
 
 
 def apply_glitch_effect(text):
@@ -505,7 +565,11 @@ def show_splash_screen(meme_images):
         ("THINKING", "finger on chin", "thinking", (0, 180, 255)),
         ("POINTING", "point up above head", "pointing", (0, 255, 120)),
         ("SHOCKED", "open mouth wide", "shocked", (80, 80, 255)),
+        ("LOVING", "hand on chest", "loving", (180, 105, 255)),
+        ("SAD", "rub your eye like you're crying", "sad", (230, 160, 60)),
+        ("MIDDLE FINGER", "show your middle finger", "middle_finger", (220, 60, 160)),
     ]
+    page_count = len(tutorial_slides) + 1
 
     for slide_index, (title, description, pose_key, color) in enumerate(tutorial_slides):
         canvas[:] = (10, 10, 10)
@@ -520,14 +584,14 @@ def show_splash_screen(meme_images):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (150, 150, 150), 1)
 
         if pose_key in meme_images:
-            thumbnail = cv2.resize(meme_images[pose_key], (300, 170))
+            thumbnail = fit_to_frame(meme_images[pose_key], 300, 170)
             thumb_x = screen_width // 2 - 150
             thumb_y = 160
             canvas[thumb_y : thumb_y + 170, thumb_x : thumb_x + 300] = thumbnail
             draw_corner_brackets(canvas, thumb_x - 2, thumb_y - 2, thumb_x + 302, thumb_y + 172,
                                  color, corner_length=12, thickness=2)
 
-        page_text = f"{slide_index + 1}/5"
+        page_text = f"{slide_index + 1}/{page_count}"
         cv2.putText(canvas, page_text, (screen_width - 60, screen_height - 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 60, 60), 1)
         cv2.putText(canvas, "SPACE to continue", (screen_width // 2 - 80, screen_height - 50),
@@ -564,7 +628,7 @@ def show_splash_screen(meme_images):
         cv2.putText(canvas, control, (screen_width // 2 - 120, 110 + i * 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 180), 1)
 
-    cv2.putText(canvas, "5/5", (screen_width - 60, screen_height - 30),
+    cv2.putText(canvas, f"{page_count}/{page_count}", (screen_width - 60, screen_height - 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 60, 60), 1)
     cv2.putText(canvas, "SPACE to start", (screen_width // 2 - 70, screen_height - 50),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (80, 80, 80), 1)
@@ -604,6 +668,15 @@ def detect_current_pose(pose_results, frame_width, frame_height):
     left_finger = get_finger_position(pose_results.left_hand_landmarks)
     mouth_ratio = calculate_mouth_openness(pose_results.face_landmarks)
 
+    if (is_middle_finger_up(pose_results.right_hand_landmarks)
+            or is_middle_finger_up(pose_results.left_hand_landmarks)):
+        return "middle_finger", should_flip
+
+    # A fist on the eye also holds the fingertips above the nose, so this goes before pointing
+    if (is_hand_on_eye(pose_results.right_hand_landmarks, landmarks, frame_width, frame_height)
+            or is_hand_on_eye(pose_results.left_hand_landmarks, landmarks, frame_width, frame_height)):
+        return "sad", should_flip
+
     is_thinking = False
 
     if right_finger is not None:
@@ -628,8 +701,13 @@ def detect_current_pose(pose_results, frame_width, frame_height):
             detected_pose = "pointing"
             should_flip = True
 
-    if detected_pose == "staring" and mouth_ratio > MOUTH_OPEN_THRESHOLD:
-        detected_pose = "shocked"
+    if detected_pose == "staring":
+        # Wrist, pinky and index knuckles of each hand in the pose landmarks
+        if (is_hand_on_chest(landmarks, (15, 17, 19), frame_width, frame_height)
+                or is_hand_on_chest(landmarks, (16, 18, 20), frame_width, frame_height)):
+            detected_pose = "loving"
+        elif mouth_ratio > MOUTH_OPEN_THRESHOLD:
+            detected_pose = "shocked"
 
     return detected_pose, should_flip
 
@@ -701,7 +779,7 @@ def draw_header_ui(canvas, state, frame_width, current_pose):
     cv2.line(canvas, (15, 17), (31, 33), (150, 150, 150), 1)
     cv2.line(canvas, (31, 17), (15, 33), (150, 150, 150), 1)
 
-    pose_text = current_pose.upper()
+    pose_text = current_pose.upper().replace("_", " ")
     if state.chaos_mode:
         pose_text = apply_glitch_effect(pose_text)
 
@@ -1194,6 +1272,12 @@ def main():
                             int(meme_width * 0.75), int(meme_height * 0.55)),
                 "staring": (int(meme_width * 0.25), int(meme_height * 0.08),
                             int(meme_width * 0.75), int(meme_height * 0.58)),
+                "loving": (int(meme_width * 0.3), int(meme_height * 0.03),
+                           int(meme_width * 0.72), int(meme_height * 0.48)),
+                "sad": (int(meme_width * 0.25), int(meme_height * 0.03),
+                        int(meme_width * 0.78), int(meme_height * 0.52)),
+                "middle_finger": (int(meme_width * 0.33), int(meme_height * 0.02),
+                                  int(meme_width * 0.78), int(meme_height * 0.5)),
             }
             if display_pose in face_target_regions:
                 current_meme = blend_face_onto_meme(

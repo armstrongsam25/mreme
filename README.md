@@ -1,12 +1,15 @@
 # Mreme / Meme Mirror
 
-A real-time pose detection application built with Python, OpenCV, and MediaPipe that displays specific monkey memes based on your body poses. The app uses computer vision to instantly detect and match four distinct states: Staring (neutral), Thinking (hand on mouth), Pointing (finger up), and Shocked (open mouth), displaying the corresponding monkey meme template in real-time.
+A real-time pose detection application built with Python, OpenCV, and MediaPipe that displays specific monkey memes based on your body poses. The app uses computer vision to instantly detect and match seven distinct states: Staring (neutral), Thinking (hand on mouth), Pointing (finger up), Shocked (open mouth), Loving (hand on chest), Sad (crying), and Middle Finger, displaying the corresponding monkey meme template in real-time.
 
 <p align="center">
   <img src="memes/staring.jpg" width="180" />
   <img src="memes/thinking.jpg" width="180" />
   <img src="memes/pointing.jpg" width="180" />
   <img src="memes/shocked.jpg" width="180" />
+  <img src="memes/loving.jpg" width="180" />
+  <img src="memes/sad.jpg" width="180" />
+  <img src="memes/middle_finger.jpg" width="180" />
 </p>
 
 ## Features
@@ -27,6 +30,9 @@ A real-time pose detection application built with Python, OpenCV, and MediaPipe 
 | Thinking | Touch your finger to your chin |
 | Pointing | Point your finger above your head |
 | Shocked | Open your mouth wide |
+| Loving | Put your hand on your chest |
+| Sad | Rub your eye with your fist like you're crying |
+| Middle Finger | Show your middle finger |
 
 ## Requirements
 
